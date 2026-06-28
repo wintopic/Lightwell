@@ -1,0 +1,29 @@
+# Gradle and Android build output
+.gradle/
+build/
+app/build/
+
+# Local Android SDK configuration
+local.properties
+
+# Generated packages and reports
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+*.hprof
+*.log
+
+# IDE files
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
