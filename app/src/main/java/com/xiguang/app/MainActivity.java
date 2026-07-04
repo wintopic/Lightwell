@@ -76,7 +76,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.text.Collator;
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -87,6 +92,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 public class MainActivity extends Activity {
     private static final String PREFS = "desktop_prefs";
@@ -111,6 +120,8 @@ public class MainActivity extends Activity {
     private static final String PREF_VISUAL_REVISION = "visual_revision";
     private static final String PREF_TRANSPARENT_THEME = "transparent_theme";
     private static final String EXTRA_SHOW_SETTINGS = "show_settings";
+    private static final String LATEST_RELEASE_API_URL = "https://api.github.com/repos/wintopic/Lightwell/releases/latest";
+    private static final String RELEASES_URL = "https://github.com/wintopic/Lightwell/releases/latest";
     private static final int CURRENT_VISUAL_REVISION = 3;
     private static final int PAGE_ANIM_DEFAULT = 0;
     private static final int PAGE_ANIM_GRID_FLIP = 3;
@@ -345,6 +356,7 @@ public class MainActivity extends Activity {
     private int appLoadToken;
     private volatile int texturePreloadToken;
     private volatile boolean activityDestroyed;
+    private volatile boolean checkingForUpdates;
     private boolean desktopLoadingDismissed = true;
     private boolean pendingDesktopIconRefresh;
     private boolean pendingSearchIconRefresh;
@@ -2777,10 +2789,14 @@ public class MainActivity extends Activity {
     }
 
     private String getAppVersionLabel() {
+        return formatVersionLabel(getCurrentVersionName());
+    }
+
+    private String getCurrentVersionName() {
         try {
             PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
             if (!TextUtils.isEmpty(packageInfo.versionName)) {
-                return "v" + packageInfo.versionName;
+                return packageInfo.versionName;
             }
         } catch (PackageManager.NameNotFoundException | SecurityException ignored) {
             // Fall through to the local build label.
@@ -2788,8 +2804,230 @@ public class MainActivity extends Activity {
         return getString(R.string.version_local_build);
     }
 
+    private long getCurrentVersionCode() {
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                return packageInfo.getLongVersionCode();
+            }
+            return packageInfo.versionCode;
+        } catch (PackageManager.NameNotFoundException | SecurityException ignored) {
+            return 0L;
+        }
+    }
+
+    private String getAppVersionSummary() {
+        return getString(R.string.version_current_format, getAppVersionLabel(), getCurrentVersionCode());
+    }
+
     private void checkForUpdates() {
-        Toast.makeText(this, getString(R.string.version_info_toast, getAppVersionLabel()), Toast.LENGTH_SHORT).show();
+        if (checkingForUpdates) {
+            Toast.makeText(this, R.string.checking_update, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        final String currentVersion = getCurrentVersionName();
+        checkingForUpdates = true;
+        Toast.makeText(this, R.string.checking_update, Toast.LENGTH_SHORT).show();
+
+        appExecutor.execute(() -> {
+            try {
+                UpdateInfo updateInfo = fetchLatestReleaseInfo();
+                boolean hasUpdate = isVersionNewer(updateInfo.versionName, currentVersion);
+                mainHandler.post(() -> {
+                    checkingForUpdates = false;
+                    if (hasUpdate) {
+                        showUpdateAvailableDialog(updateInfo, currentVersion);
+                    } else {
+                        Toast.makeText(this, getString(R.string.already_latest_version,
+                                getAppVersionLabel()), Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } catch (IOException | JSONException exception) {
+                mainHandler.post(() -> {
+                    checkingForUpdates = false;
+                    Toast.makeText(this, R.string.update_check_failed, Toast.LENGTH_SHORT).show();
+                });
+            }
+        });
+    }
+
+    private UpdateInfo fetchLatestReleaseInfo() throws IOException, JSONException {
+        HttpURLConnection connection = null;
+        try {
+            URL url = new URL(LATEST_RELEASE_API_URL);
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(8000);
+            connection.setRequestProperty("Accept", "application/vnd.github+json");
+            connection.setRequestProperty("User-Agent", "Lightwell-Android");
+
+            int responseCode = connection.getResponseCode();
+            InputStream responseStream = responseCode >= 200 && responseCode < 300
+                    ? connection.getInputStream()
+                    : connection.getErrorStream();
+            String body = readResponseBody(responseStream);
+            if (responseCode < 200 || responseCode >= 300) {
+                throw new IOException("GitHub release request failed: " + responseCode);
+            }
+
+            JSONObject release = new JSONObject(body);
+            String tagName = release.optString("tag_name");
+            String title = release.optString("name");
+            String htmlUrl = release.optString("html_url", RELEASES_URL);
+            String versionName = extractVersionName(tagName);
+            if (TextUtils.isEmpty(versionName)) {
+                versionName = extractVersionName(title);
+            }
+            String downloadUrl = findReleaseApkUrl(release.optJSONArray("assets"));
+            if (TextUtils.isEmpty(downloadUrl)) {
+                downloadUrl = htmlUrl;
+            }
+            return new UpdateInfo(versionName, downloadUrl);
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private String readResponseBody(InputStream stream) throws IOException {
+        if (stream == null) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line).append('\n');
+            }
+        }
+        return builder.toString();
+    }
+
+    private String findReleaseApkUrl(JSONArray assets) {
+        if (assets == null) {
+            return "";
+        }
+        String fallbackApkUrl = "";
+        for (int i = 0; i < assets.length(); i++) {
+            JSONObject asset = assets.optJSONObject(i);
+            if (asset == null) {
+                continue;
+            }
+            String name = asset.optString("name");
+            String lowerName = name == null ? "" : name.toLowerCase(Locale.US);
+            if (!lowerName.endsWith(".apk")) {
+                continue;
+            }
+            String url = asset.optString("browser_download_url");
+            if (TextUtils.isEmpty(url)) {
+                continue;
+            }
+            if (!lowerName.contains("debug")) {
+                return url;
+            }
+            if (TextUtils.isEmpty(fallbackApkUrl)) {
+                fallbackApkUrl = url;
+            }
+        }
+        return fallbackApkUrl;
+    }
+
+    private boolean isVersionNewer(String latestVersion, String currentVersion) {
+        String latest = extractVersionName(latestVersion);
+        String current = extractVersionName(currentVersion);
+        if (TextUtils.isEmpty(latest) || TextUtils.isEmpty(current)) {
+            return false;
+        }
+
+        String[] latestParts = latest.split("\\.");
+        String[] currentParts = current.split("\\.");
+        int length = Math.max(latestParts.length, currentParts.length);
+        for (int i = 0; i < length; i++) {
+            int latestPart = i < latestParts.length ? parseVersionPart(latestParts[i]) : 0;
+            int currentPart = i < currentParts.length ? parseVersionPart(currentParts[i]) : 0;
+            if (latestPart != currentPart) {
+                return latestPart > currentPart;
+            }
+        }
+        return false;
+    }
+
+    private int parseVersionPart(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(value.replaceAll("[^0-9]", ""));
+        } catch (NumberFormatException exception) {
+            return 0;
+        }
+    }
+
+    private String extractVersionName(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return "";
+        }
+        String trimmed = value.trim();
+        int start = -1;
+        for (int i = 0; i < trimmed.length(); i++) {
+            if (Character.isDigit(trimmed.charAt(i))) {
+                start = i;
+                break;
+            }
+        }
+        if (start < 0) {
+            return "";
+        }
+        StringBuilder version = new StringBuilder();
+        for (int i = start; i < trimmed.length(); i++) {
+            char character = trimmed.charAt(i);
+            if (Character.isDigit(character) || character == '.') {
+                version.append(character);
+            } else {
+                break;
+            }
+        }
+        while (version.length() > 0 && version.charAt(version.length() - 1) == '.') {
+            version.deleteCharAt(version.length() - 1);
+        }
+        return version.toString();
+    }
+
+    private String formatVersionLabel(String versionName) {
+        if (TextUtils.isEmpty(versionName)) {
+            return getString(R.string.version_local_build);
+        }
+        if (versionName.startsWith("v") || versionName.startsWith("V")) {
+            return versionName;
+        }
+        if (TextUtils.isEmpty(extractVersionName(versionName))) {
+            return versionName;
+        }
+        return "v" + versionName;
+    }
+
+    private void showUpdateAvailableDialog(UpdateInfo updateInfo, String currentVersion) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.update_available_title)
+                .setMessage(getString(R.string.update_available_message,
+                        formatVersionLabel(currentVersion), formatVersionLabel(updateInfo.versionName)))
+                .setPositiveButton(R.string.update_download,
+                        (dialog, which) -> openUpdateUrl(updateInfo.downloadUrl))
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+    }
+
+    private void openUpdateUrl(String url) {
+        String targetUrl = TextUtils.isEmpty(url) ? RELEASES_URL : url;
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl));
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException exception) {
+            Toast.makeText(this, R.string.open_update_failed, Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void openBatteryOptimizationSettings() {
@@ -3004,9 +3242,21 @@ public class MainActivity extends Activity {
         LinearLayout content = createSettingsSubPageContent();
         LinearLayout card = createSettingsCard();
         addSettingsRow(card, createInfoSettingsRow(getString(R.string.about_us),
-                getString(R.string.about_us_message) + "\n\n" + getString(R.string.app_name) + " " + getAppVersionLabel(),
+                getString(R.string.about_us_message),
                 createSettingsIcon("about")));
         content.addView(card);
+        addVerticalSpace(content, dp(18));
+
+        LinearLayout versionCard = createSettingsCard();
+        addSettingsRow(versionCard, createInfoSettingsRow(getString(R.string.launcher_reference_version),
+                getAppVersionSummary(), createSettingsIcon("version")));
+        content.addView(versionCard);
+        addVerticalSpace(content, dp(18));
+
+        LinearLayout actionCard = createSettingsCard();
+        addSettingsRow(actionCard, createSimpleSettingsRow(R.string.check_update, getAppVersionLabel(),
+                true, createSettingsIcon("version"), v -> checkForUpdates()));
+        content.addView(actionCard);
         return createSettingsSubPage(R.string.about_us, SETTINGS_PAGE_MAIN, content);
     }
 
@@ -7236,6 +7486,16 @@ public class MainActivity extends Activity {
             this.dockColor = dockColor;
             this.accentColor = accentColor;
             this.light = light;
+        }
+    }
+
+    private static final class UpdateInfo {
+        final String versionName;
+        final String downloadUrl;
+
+        UpdateInfo(String versionName, String downloadUrl) {
+            this.versionName = versionName;
+            this.downloadUrl = downloadUrl;
         }
     }
 

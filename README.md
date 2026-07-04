@@ -83,6 +83,27 @@ The debug APK is generated at:
 app/build/outputs/apk/desktop/debug/app-desktop-debug.apk
 ```
 
+Release builds use the `desktopRelease` variant and are signed from environment variables:
+
+```bash
+export ANDROID_KEYSTORE_FILE=/path/to/release.jks
+export ANDROID_KEYSTORE_PASSWORD=...
+export ANDROID_KEY_ALIAS=...
+export ANDROID_KEY_PASSWORD=...
+./gradlew :app:assembleDesktopRelease --console=plain
+```
+
+GitHub Actions expects the same signing data in repository secrets:
+
+```text
+ANDROID_KEYSTORE_BASE64
+ANDROID_KEYSTORE_PASSWORD
+ANDROID_KEY_ALIAS
+ANDROID_KEY_PASSWORD
+```
+
+`ANDROID_KEYSTORE_BASE64` is the base64-encoded release keystore file.
+
 Install to a connected device:
 
 ```bash
